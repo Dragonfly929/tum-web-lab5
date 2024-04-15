@@ -1,7 +1,7 @@
 import argparse
 import ssl
 import socket
-
+import json
 from urllib.parse import urlparse
 from bs4 import BeautifulSoup
 from lxml import etree
@@ -11,14 +11,11 @@ HTTPS_PORT = 443
 
 
 class Parser:
-
     def parse_url(self, url):
         parsed_url = urlparse(url)
-
         scheme = parsed_url.scheme
         host = parsed_url.netloc
         path = parsed_url.path
-
         return [scheme, host, path]
 
     def parse_html_page(self, data):
@@ -28,20 +25,22 @@ class Parser:
     def parse_html_links(self, data):
         soup = BeautifulSoup(data, "html.parser")
         dom = etree.HTML(str(soup))
-
         links = dom.xpath("//span/a//following-sibling::h3/../@href")
         return links
 
 
 class HTTPHandler:
-
     def __init__(self):
         self.search_link = "https://www.google.com/search?q={}"
         self.search_path = "/search?q={}"
         self.parser = Parser()
+        self.cache = {}
 
-    def request(self, host, port, path):
-        response = b""  # Initialize response as bytes
+    def request(self, host, port, path, redirect_count=5):
+        if redirect_count == 0:
+            return None, None
+
+        response = b""
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.connect((host, port))
 
@@ -50,43 +49,54 @@ class HTTPHandler:
             sock = ctx.wrap_socket(sock, server_hostname=host)
 
         sock.sendall(
-            (f"GET {path} HTTP/1.1\r\n" +
-             f"Host: {host}\r\n" +
-             "Connection: close\r\n" +
-             "User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:123.0) Gecko/20100101 Firefox/123.0\r\n" +
-             "Accept: */*\r\n" +
+            (f"GET {path} HTTP/1.1\r\n"
+             f"Host: {host}\r\n"
+             "Connection: close\r\n"
+             "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0\r\n"
+             "Accept: */*\r\n"
              "\r\n").encode()
         )
+
 
         while True:
             data = sock.recv(4096)
             if not data:
                 break
-            response += data  # Append received data to response bytes
+            response += data
 
         sock.close()
 
         try:
-            response_text = response.decode("utf-8")  # Attempt to decode response
+            response_text = response.decode("utf-8")
         except UnicodeDecodeError as e:
             print(f"Error decoding response: {e}")
-            return None, None  # Return None values to indicate decoding failure
+            return None, None
 
         headers, body = response_text.split("\r\n\r\n", 1)
+        status_line = headers.split("\r\n")[0]
+        status_code = int(status_line.split(" ")[1])
+
+        if status_code in [301, 302]:  # Handle redirects
+            redirect_url = headers.split("\r\n")[7].split(" ")[1]
+            redirect_host, redirect_path = self.parser.parse_url(redirect_url)[1:]
+            return self.request(redirect_host, port, redirect_path, redirect_count - 1)
+
         return headers, body
 
     def search(self, queries):
         search_query = '+'.join(queries)
-
         port = HTTPS_PORT
         path = self.search_path.format(search_query)
-        host = urlparse(
-            self.search_link.format(search_query)
-        ).netloc
+        host = urlparse(self.search_link.format(search_query)).netloc
 
-        _, body = self.request(host, port, path)
+        if path in self.cache:
+            return self.cache[path]
+
+        headers, body = self.request(host, port, path)
         if body:
-            return self.parser.parse_html_links(body)
+            links = self.parser.parse_html_links(body)[:10]
+            self.cache[path] = links
+            return links
         else:
             return []
 
